@@ -117,7 +117,7 @@ class AudioVideoFusionWrapper(nn.Module):
     - Audio: VGGish (128-D) -> Linear Layer (512-D).
     - Text Encoder: Excluded entirely.
     """
-    def __init__(self, visual_model_name, device="cuda" if torch.cuda.is_available() else "cpu"):
+    def __init__(self, visual_model_name, device="cuda"):
         super().__init__()
         self.device = device
         self.visual_model_name = visual_model_name
@@ -208,9 +208,9 @@ def run_benchmark(models_dict, dataset):
     print(json.dumps(results, indent=4))
 
 if __name__ == "__main__":
-    JSON_PATH = "/mnt/gpu_users/achyut/Simarjeet/MVoQA/AVQA_outputs/modified_train_multi.json"
-    VIDEO_DIR = "/mnt/gpu_users/achyut/Simarjeet/MVoQA/AVQA_outputs/video_only"
-    AUDIO_DIR = "/mnt/gpu_users/achyut/Simarjeet/MVoQA/AVQA_outputs/audio_only"
+    JSON_PATH = "./MVoQA/AVQA_outputs/modified_train_multi.json"
+    VIDEO_DIR = "./MVoQA/AVQA_outputs/video_only"
+    AUDIO_DIR = "./MVoQA/AVQA_outputs/audio_only"
     
     dataset = VoQADataset(JSON_PATH, VIDEO_DIR, AUDIO_DIR)
     
