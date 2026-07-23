@@ -1,8 +1,43 @@
+"""
+VoQA Zero-Shot Multi-Model Benchmark
+======================================
+Video-only Question Answering where the "question" is burned in as a
+watermark on the video frames (no separate text question input), paired
+with an audio track (MUSIC-AVQA-style segment sampling). Evaluates a
+REGISTRY of Hugging Face vision-language models sequentially on one GPU.
+
+HONESTY NOTE ON SCOPE:
+  "All possible Hugging Face VLMs" isn't literally achievable in one script
+  -- there are thousands of checkpoints and no single shared API (some use
+  `.chat(...)`, some take a raw text prompt with no chat template, some
+  ship fully custom `trust_remote_code` inference code). What this script
+  actually does: it covers the major open-source VLM families through FOUR
+  general inference strategies (see STRATEGY REGISTRY below), and gives you
+  a one-line pattern to register any additional model that fits one of
+  those strategies. Anything requiring genuinely bespoke code (e.g. a
+  model with a non-standard multi-stage pipeline) will need its own
+  wrapper -- the registry makes that a ~15-line addition, not a rewrite.
+
+Design constraints (unchanged from before):
+  - Zero-shot only: no fine-tuning, no gradient updates, pretrained weights only.
+  - Default mode "pure_zero_shot": no instruction text where the model's API
+    allows it (VoQA paper Sec 3.3.1 -- image tokens only, model must notice,
+    read, and answer the watermark completely unprompted).
+  - Audio branch: VGGish (torchvggish), forward pass only. Segmented into
+    ~1s chunks and subsampled at the same 6s stride as the video frames
+    (MUSIC-AVQA Sec 5.1), logged per model run. NOT fused into the answer,
+    and deliberately has NO trainable projection layer -- an untrained
+    nn.Linear(128,512) is random noise, not a feature transform, so it
+    cannot legitimately contribute to a "zero-shot, no fine-tuning" answer.
+    If you need real audio-conditioned answers, that requires a training
+    stage (a frozen-backbone linear probe is the minimal honest option --
+    ask and I'll add it as a separate opt-in stage).
+"""
+
 import os
 import re
+import gc
 import json
-import time
-import sys
 import torch
 import torch.nn as nn
 import torchaudio
@@ -11,211 +46,429 @@ from PIL import Image
 from tqdm import tqdm
 
 # ==========================================
-# 1. DATASET HANDLER (STRICT SAMPLING)
+# 1. DATASET HANDLER (segment-aligned audio + video)
 # ==========================================
 class VoQADataset:
-    def __init__(self, json_path, video_dir, audio_dir):
+    def __init__(self, json_path, video_dir, audio_dir, seconds_per_sample=6):
         self.video_dir = video_dir
         self.audio_dir = audio_dir
-        
-        print(f"[INFO] Loading full dataset from {json_path}...")
-        with open(json_path, 'r', encoding='utf-8') as f:
-            self.data = json.load(f)
+        self.seconds_per_sample = seconds_per_sample
 
-        print(f"[INFO] Loaded {len(self.data)} total samples.")
+        print(f"[INFO] Loading dataset index from {json_path}...")
+        with open(json_path, "r", encoding="utf-8") as f:
+            self.data = json.load(f)
+        print(f"[INFO] Loaded {len(self.data)} samples.")
 
     def __len__(self):
         return len(self.data)
-        
-    def _extract_frames_experimental(self, video_path):
-        """
-        Extracts 1 frame every 6 seconds (equivalent to taking 1s every 6s at 1 fps).
-        """
+
+    def _extract_frames(self, video_path):
+        """1 frame sampled every `seconds_per_sample` seconds."""
         cap = cv2.VideoCapture(video_path)
         frames = []
-        
         if not cap.isOpened():
             return frames
-            
+
         fps = cap.get(cv2.CAP_PROP_FPS)
-        if fps == 0 or fps is None:
-            fps = 30.0 # Fallback if OpenCV fails to read fps metadata
-            
-        frame_interval = int(fps * 6) # 1 frame every 6 seconds
+        if not fps or fps <= 0:
+            fps = 30.0
+
+        frame_interval = max(1, int(fps * self.seconds_per_sample))
         total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        
+
         for idx in range(0, total_frames, frame_interval):
             cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
             ret, frame = cap.read()
             if not ret:
                 break
-                
-            # Convert BGR (OpenCV default) to RGB, then to PIL Image
             frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             frames.append(Image.fromarray(frame_rgb))
-                    
+
         cap.release()
         return frames
 
-    def _process_audio_experimental(self, audio_path):
-        """
-        Loads audio and resamples to exactly 16 kHz as per the paper.
-        """
-        target_sample_rate = 16000
+    def _load_audio(self, audio_path, target_sr=16000):
         try:
-            waveform, sample_rate = torchaudio.load(audio_path)
-            
-            # Resample if the native audio is not 16kHz
-            if sample_rate != target_sample_rate:
-                resampler = torchaudio.transforms.Resample(orig_freq=sample_rate, new_freq=target_sample_rate)
-                waveform = resampler(waveform)
-                
-            return waveform, target_sample_rate
-        except Exception as e:
+            waveform, sr = torchaudio.load(audio_path)
+            if sr != target_sr:
+                waveform = torchaudio.transforms.Resample(sr, target_sr)(waveform)
+            return waveform, target_sr
+        except Exception:
             return None, None
 
     def get_sample(self, idx):
         item = self.data[idx]
-        
+
         if "video_only_id" in item or "video_audio_id" in item:
             video_filename = item.get("video_only_id", item.get("video_audio_id"))
-            audio_filename = item.get("audio_id")
+            audio_filename = item.get("audio_id", video_filename)
         else:
             video_id = item.get("video_id")
             video_filename = f"{video_id}.mp4" if not str(video_id).endswith(".mp4") else str(video_id)
-            audio_filename = video_filename 
-            
-        ground_truth = item.get("anser", item.get("answer", "")).strip().lower()
-        
+            audio_filename = video_filename
+
+        ground_truth = item.get("answer", item.get("anser", "")).strip().lower()
+
         video_path = os.path.join(self.video_dir, video_filename)
         audio_path = os.path.join(self.audio_dir, audio_filename)
-        
-        # Apply strict experimental sampling
-        extracted_frames = self._extract_frames_experimental(video_path)
-        audio_waveform, sample_rate = self._process_audio_experimental(audio_path)
+
+        frames = self._extract_frames(video_path)
+        waveform, sr = self._load_audio(audio_path)
 
         return {
             "id": video_filename,
             "ground_truth": ground_truth,
             "video_path": video_path,
-            "frames": extracted_frames,
-            "audio_waveform": audio_waveform,
-            "sample_rate": sample_rate
+            "frames": frames,
+            "audio_waveform": waveform,
+            "sample_rate": sr,
         }
 
-# ==========================================
-# 2. MODEL WRAPPERS & VGGISH AUDIO
-# ==========================================
+
 def normalize_text(text):
     text = str(text).lower().strip()
-    return re.sub(r'[^\w\s]', '', text)
+    return re.sub(r"[^\w\s]", "", text)
 
-class AudioVideoFusionWrapper(nn.Module):
-    """
-    Implements the pure Audio-Visual architecture from the paper.
-    - Video: Processed via target open-source visual model.
-    - Audio: VGGish (128-D) -> Linear Layer (512-D).
-    - Text Encoder: Excluded entirely.
-    """
-    def __init__(self, visual_model_name, device="cuda"):
-        super().__init__()
+
+def filter_response(raw_text, max_answer_words=6):
+    """Trims free-form zero-shot generations down to a short answer span."""
+    text = str(raw_text).strip()
+    text = text.split("\n")[0]
+    text = re.split(r"[.!?]", text)[0]
+    words = text.split()
+    if len(words) > max_answer_words:
+        text = " ".join(words[:max_answer_words])
+    return normalize_text(text)
+
+
+# ==========================================
+# 2. AUDIO BRANCH — VGGish, forward pass only, logged not fused
+# ==========================================
+class VGGishAudioEncoder:
+    def __init__(self, device="cuda"):
         self.device = device
-        self.visual_model_name = visual_model_name
-        
-        print(f"[INFO] Initializing VGGish Audio Encoder (16kHz) -> 512-D Linear Layer...")
-        # Load Pre-trained VGGish from torch hub
-        self.vggish = torch.hub.load('harritaylor/torchvggish', 'vggish', trust_repo=True)
-        self.vggish.eval()
-        self.vggish.to(self.device)
-        
-        # Linear layer to project 128-D VGGish feature to 512-D as per experiments
-        self.audio_projection = nn.Linear(128, 512).to(self.device)
-        
-        print(f"[INFO] Initializing Visual Encoder: {self.visual_model_name}...")
-        # Initialize your open source visual model here (e.g. Qwen2.5-VL / InternVL)
-        # Note: Because this is a custom architectural fusion, the exact forward pass 
-        # depends on how you choose to concatenate the 512-D audio tensor into the visual LLM.
-        
-        # Example initialization placeholder for Qwen:
-        # from transformers import Qwen2_5_VLForConditionalGeneration, AutoProcessor
-        # self.visual_model = Qwen2_5_VLForConditionalGeneration.from_pretrained(visual_model_name).to(self.device)
-        # self.visual_processor = AutoProcessor.from_pretrained(visual_model_name)
+        print("[INFO] Loading pretrained VGGish (frozen, forward-pass only)...")
+        self.model = torch.hub.load("harritaylor/torchvggish", "vggish", trust_repo=True)
+        self.model.eval()
+        self.model.to(self.device)
+        for p in self.model.parameters():
+            p.requires_grad = False
+
+    @torch.no_grad()
+    def encode_segments(self, waveform, sample_rate, seconds_per_sample=6):
+        """Returns (T,128) segment embeddings subsampled to the video's stride, or None."""
+        if waveform is None:
+            return None
+        mono = waveform.mean(dim=0).cpu().numpy()
+        try:
+            full_embeddings = self.model(mono, sample_rate)
+        except Exception as e:
+            print(f"[WARN] VGGish forward failed: {e}")
+            return None
+        full_embeddings = full_embeddings.detach().cpu().numpy()
+        if full_embeddings.ndim == 1:
+            full_embeddings = full_embeddings[None, :]
+        return full_embeddings[::seconds_per_sample]
+
+
+# ==========================================
+# 3. STRATEGY REGISTRY — general inference patterns covering most HF VLMs
+# ==========================================
+PURE_ZERO_SHOT_TEXT = None   # no instruction text at all (default, paper-faithful)
+LIGHT_PROMPT_TEXT = (
+    "There is a question embedded as text in this image. "
+    "Locate it, then answer it in one short word or phrase."
+)
+
+
+class BaseVLMWrapper:
+    """Common no-op interface; subclasses implement `_generate`."""
+
+    def __init__(self, model_path, device="cuda", instruction=PURE_ZERO_SHOT_TEXT):
+        self.model_path = model_path
+        self.device = device
+        self.instruction = instruction
 
     def predict(self, sample):
-        # 1. Process Audio (16kHz waveform -> VGGish -> 128-D -> Linear -> 512-D)
-        audio_feature_512 = None
-        if sample["audio_waveform"] is not None:
-            with torch.no_grad():
-                # VGGish expects a specific numpy format or tensor; 
-                # passing the raw waveform (flattened if stereo)
-                waveform = sample["audio_waveform"].mean(dim=0).cpu().numpy()
-                vggish_128 = self.vggish(waveform) # shape: (num_segments, 128)
-                vggish_128 = vggish_128.to(self.device)
-                audio_feature_512 = self.audio_projection(vggish_128) # shape: (num_segments, 512)
-
-        # 2. Process Video (Frames sampled 1s every 6s)
-        frames = sample["frames"]
+        frames = sample.get("frames")
         if not frames:
             return ""
+        try:
+            raw = self._generate(frames)
+        except Exception as e:
+            print(f"[WARN] Generation failed for {self.model_path}: {e}")
+            return ""
+        return filter_response(raw)
 
-        # 3. Fusion & Prediction
-        # Here you fuse the `audio_feature_512` with the `frames` through your 
-        # visual model to generate the prediction without an explicit text question input.
-        # output = self.visual_model(frames=frames, audio_embeds=audio_feature_512)
-        
-        prediction = "two" # Placeholder output
-        return normalize_text(prediction)
+    def _generate(self, frames):
+        raise NotImplementedError
 
-# ==========================================
-# 3. MASTER BENCHMARK EVALUATION LOOP
-# ==========================================
-def run_benchmark(models_dict, dataset):
-    results = {}
-    total_samples = len(dataset)
-    
-    for model_name, model_instance in models_dict.items():
-        print(f"\n{'='*50}\nStarting Strict Experimental Evaluation: {model_name}\n{'='*50}")
-        correct = 0
-        evaluated_count = 0
-        
-        for idx in tqdm(range(total_samples), desc=f"Evaluating {model_name}"):
-            sample = dataset.get_sample(idx)
-            
-            if not os.path.exists(sample["video_path"]) or not sample["frames"]:
-                continue
-                
-            prediction = model_instance.predict(sample)
-            gt = normalize_text(sample["ground_truth"])
-            
-            if gt in prediction or prediction in gt:
-                correct += 1
-            evaluated_count += 1
-                
-        accuracy = (correct / evaluated_count) * 100 if evaluated_count > 0 else 0.0
-        results[model_name] = {
-            "accuracy": round(accuracy, 2),
-            "correct": correct,
-            "total_evaluated": evaluated_count
-        }
-        print(f"\n[RESULT] {model_name} Accuracy: {accuracy:.2f}% ({correct}/{evaluated_count})")
-        
-        del model_instance
+    def unload(self):
+        if hasattr(self, "model"):
+            del self.model
+        gc.collect()
         torch.cuda.empty_cache()
 
-    print("\n" + "="*50)
-    print("FINAL EXPERIMENTAL RESULTS:")
-    print("="*50)
-    print(json.dumps(results, indent=4))
+
+class ChatTemplateMultiImageWrapper(BaseVLMWrapper):
+    """
+    Strategy for models supporting the unified `AutoModelForImageTextToText`
+    + `AutoProcessor.apply_chat_template` API with multiple image inputs.
+    Covers: Qwen2-VL / Qwen2.5-VL, LLaVA-NeXT, LLaVA-OneVision, Idefics2/3,
+    Pixtral, Llama-3.2-Vision, SmolVLM, and most current transformers-native
+    multi-image chat VLMs.
+    """
+
+    def __init__(self, model_path, device="cuda", instruction=PURE_ZERO_SHOT_TEXT,
+                 max_new_tokens=20, torch_dtype=torch.float16, trust_remote_code=False):
+        super().__init__(model_path, device, instruction)
+        from transformers import AutoModelForImageTextToText, AutoProcessor
+
+        self.max_new_tokens = max_new_tokens
+        self.model = AutoModelForImageTextToText.from_pretrained(
+            model_path, torch_dtype=torch_dtype, device_map=device,
+            trust_remote_code=trust_remote_code,
+        )
+        self.model.eval()
+        for p in self.model.parameters():
+            p.requires_grad = False
+        self.processor = AutoProcessor.from_pretrained(model_path, trust_remote_code=trust_remote_code)
+
+    @torch.no_grad()
+    def _generate(self, frames):
+        content = [{"type": "image", "image": f} for f in frames]
+        if self.instruction:
+            content.append({"type": "text", "text": self.instruction})
+        messages = [{"role": "user", "content": content}]
+
+        try:
+            text_prompt = self.processor.apply_chat_template(
+                messages, tokenize=False, add_generation_prompt=True
+            )
+        except Exception:
+            content.append({"type": "text", "text": ""})
+            messages = [{"role": "user", "content": content}]
+            text_prompt = self.processor.apply_chat_template(
+                messages, tokenize=False, add_generation_prompt=True
+            )
+
+        inputs = self.processor(
+            text=[text_prompt], images=frames, return_tensors="pt", padding=True
+        ).to(self.device)
+
+        output_ids = self.model.generate(**inputs, max_new_tokens=self.max_new_tokens, do_sample=False)
+        trimmed = output_ids[:, inputs["input_ids"].shape[1]:]
+        return self.processor.batch_decode(trimmed, skip_special_tokens=True)[0]
+
+
+class ChatTemplateSingleImageWrapper(ChatTemplateMultiImageWrapper):
+    """
+    Same API family as above, but for models that only reliably support a
+    single image per turn (LLaVA-1.5 being the classic case). Uses the
+    middle sampled frame as the representative frame.
+    """
+
+    @torch.no_grad()
+    def _generate(self, frames):
+        middle_frame = frames[len(frames) // 2]
+        content = [{"type": "image", "image": middle_frame}]
+        if self.instruction:
+            content.append({"type": "text", "text": self.instruction})
+        messages = [{"role": "user", "content": content}]
+
+        try:
+            text_prompt = self.processor.apply_chat_template(
+                messages, tokenize=False, add_generation_prompt=True
+            )
+        except Exception:
+            content.append({"type": "text", "text": ""})
+            messages = [{"role": "user", "content": content}]
+            text_prompt = self.processor.apply_chat_template(
+                messages, tokenize=False, add_generation_prompt=True
+            )
+
+        inputs = self.processor(
+            text=[text_prompt], images=[middle_frame], return_tensors="pt", padding=True
+        ).to(self.device)
+
+        output_ids = self.model.generate(**inputs, max_new_tokens=self.max_new_tokens, do_sample=False)
+        trimmed = output_ids[:, inputs["input_ids"].shape[1]:]
+        return self.processor.batch_decode(trimmed, skip_special_tokens=True)[0]
+
+
+class TrustRemoteCodeChatWrapper(BaseVLMWrapper):
+    """
+    Strategy for models that ship a custom `.chat(tokenizer_or_processor,
+    image, question, ...)` method via trust_remote_code, instead of the
+    standard generate() + chat-template pattern.
+    Covers: InternVL (older releases), MiniCPM-V, and similar.
+    """
+
+    def __init__(self, model_path, device="cuda", instruction=PURE_ZERO_SHOT_TEXT,
+                 max_new_tokens=20, torch_dtype=torch.bfloat16):
+        super().__init__(model_path, device, instruction)
+        from transformers import AutoModel, AutoTokenizer
+
+        self.max_new_tokens = max_new_tokens
+        self.model = AutoModel.from_pretrained(
+            model_path, torch_dtype=torch_dtype, low_cpu_mem_usage=True, trust_remote_code=True
+        ).eval().to(device)
+        self.tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True, use_fast=False)
+
+    def _generate(self, frames):
+        middle_frame = frames[len(frames) // 2]
+        # instruction may be None for pure zero-shot; some .chat() implementations
+        # require a non-empty question string, so fall back to "" if so.
+        question = self.instruction if self.instruction else ""
+        response, _ = self.model.chat(
+            self.tokenizer, middle_frame, question,
+            generation_config=dict(max_new_tokens=self.max_new_tokens),
+        )
+        return response
+
+
+class PromptOnlyWrapper(BaseVLMWrapper):
+    """
+    Strategy for older / non-chat-templated models that just take a raw
+    text prompt + image, no conversation structure.
+    Covers: BLIP-2, InstructBLIP, GIT, Kosmos-2, Fuyu, and similar.
+    """
+
+    def __init__(self, model_path, device="cuda", instruction=PURE_ZERO_SHOT_TEXT,
+                 max_new_tokens=20, torch_dtype=torch.float16, model_cls="vision2seq",
+                 trust_remote_code=False):
+        super().__init__(model_path, device, instruction)
+        from transformers import AutoProcessor
+        if model_cls == "vision2seq":
+            from transformers import AutoModelForVision2Seq as ModelCls
+        elif model_cls == "causal_lm":
+            from transformers import AutoModelForCausalLM as ModelCls
+        else:
+            raise ValueError(f"Unknown model_cls: {model_cls}")
+
+        self.max_new_tokens = max_new_tokens
+        self.model = ModelCls.from_pretrained(
+            model_path, torch_dtype=torch_dtype, device_map=device,
+            trust_remote_code=trust_remote_code,
+        )
+        self.model.eval()
+        for p in self.model.parameters():
+            p.requires_grad = False
+        self.processor = AutoProcessor.from_pretrained(model_path, trust_remote_code=trust_remote_code)
+
+    @torch.no_grad()
+    def _generate(self, frames):
+        middle_frame = frames[len(frames) // 2]
+        prompt_text = self.instruction if self.instruction else ""
+        inputs = self.processor(text=prompt_text, images=middle_frame, return_tensors="pt").to(self.device)
+        output_ids = self.model.generate(**inputs, max_new_tokens=self.max_new_tokens, do_sample=False)
+        return self.processor.batch_decode(output_ids, skip_special_tokens=True)[0]
+
+
+# Map registry string -> wrapper class, for a config-driven model list.
+STRATEGY_MAP = {
+    "chat_multi_image": ChatTemplateMultiImageWrapper,
+    "chat_single_image": ChatTemplateSingleImageWrapper,
+    "trust_remote_code_chat": TrustRemoteCodeChatWrapper,
+    "prompt_only": PromptOnlyWrapper,
+}
+
+
+# ==========================================
+# 4. MODEL REGISTRY — extend this list to add more models
+# ==========================================
+# Each entry: (display_name, hf_path_or_local_path, strategy, extra_kwargs)
+# `strategy` must be a key in STRATEGY_MAP.
+# To add a new model: pick the strategy matching its API, add one line here.
+MODEL_REGISTRY = [
+    ("Qwen2.5-VL-3B-Instruct", "Qwen/Qwen2.5-VL-3B-Instruct", "chat_multi_image", {}),
+    ("Qwen2-VL-7B-Instruct", "Qwen/Qwen2-VL-7B-Instruct", "chat_multi_image", {}),
+    ("LLaVA-1.5-7B", "llava-hf/llava-1.5-7b-hf", "chat_single_image", {}),
+    ("LLaVA-NeXT-Mistral-7B", "llava-hf/llava-v1.6-mistral-7b-hf", "chat_multi_image", {}),
+    ("LLaVA-OneVision-Qwen2-7B", "llava-hf/llava-onevision-qwen2-7b-ov-hf", "chat_multi_image", {}),
+    ("Idefics3-8B", "HuggingFaceM4/Idefics3-8B-Llama3", "chat_multi_image", {}),
+    ("SmolVLM-Instruct", "HuggingFaceTB/SmolVLM-Instruct", "chat_multi_image", {}),
+    ("InternVL2-2B", "OpenGVLab/InternVL2-2B", "trust_remote_code_chat", {"torch_dtype": torch.bfloat16}),
+    ("MiniCPM-V-2_6", "openbmb/MiniCPM-V-2_6", "trust_remote_code_chat", {"torch_dtype": torch.bfloat16}),
+    ("InstructBLIP-Vicuna-7B", "Salesforce/instructblip-vicuna-7b", "prompt_only", {"model_cls": "vision2seq"}),
+    ("BLIP2-OPT-2.7B", "Salesforce/blip2-opt-2.7b", "prompt_only", {"model_cls": "vision2seq"}),
+]
+
+
+# ==========================================
+# 5. BENCHMARK LOOP
+# ==========================================
+def run_benchmark(dataset, registry=MODEL_REGISTRY, device="cuda",
+                   mode="pure_zero_shot", seconds_per_sample=6,
+                   save_audio_embeddings_dir=None):
+    assert mode in ("pure_zero_shot", "light_prompt")
+    instruction = PURE_ZERO_SHOT_TEXT if mode == "pure_zero_shot" else LIGHT_PROMPT_TEXT
+
+    audio_encoder = VGGishAudioEncoder(device=device)
+    all_results = {}
+
+    for name, model_path, strategy, extra_kwargs in registry:
+        print(f"\n{'='*60}\nLoading: {name}  ({strategy})\n{'='*60}")
+        wrapper_cls = STRATEGY_MAP[strategy]
+        try:
+            wrapper = wrapper_cls(model_path, device=device, instruction=instruction, **extra_kwargs)
+        except Exception as e:
+            print(f"[ERROR] Could not load {name}: {e}")
+            all_results[name] = {"error": str(e)}
+            continue
+
+        correct, evaluated = 0, 0
+        audio_log = {}
+
+        for idx in tqdm(range(len(dataset)), desc=f"Evaluating {name}"):
+            sample = dataset.get_sample(idx)
+            if not os.path.exists(sample["video_path"]) or not sample["frames"]:
+                continue
+
+            prediction = wrapper.predict(sample)
+            gt = normalize_text(sample["ground_truth"])
+
+            audio_segments = audio_encoder.encode_segments(
+                sample["audio_waveform"], sample["sample_rate"],
+                seconds_per_sample=seconds_per_sample,
+            )
+            if audio_segments is not None:
+                audio_log[sample["id"]] = audio_segments.tolist()
+
+            if gt and (gt in prediction or prediction in gt):
+                correct += 1
+            evaluated += 1
+
+        accuracy = (correct / evaluated) * 100 if evaluated > 0 else 0.0
+        all_results[name] = {"accuracy": round(accuracy, 2), "correct": correct, "total_evaluated": evaluated}
+        print(f"[RESULT] {name}: {accuracy:.2f}% ({correct}/{evaluated})")
+
+        if save_audio_embeddings_dir and audio_log:
+            os.makedirs(save_audio_embeddings_dir, exist_ok=True)
+            out_path = os.path.join(save_audio_embeddings_dir, f"{name}_{mode}_audio.json")
+            with open(out_path, "w") as f:
+                json.dump(audio_log, f)
+
+        wrapper.unload()
+
+    print("\n" + "=" * 60)
+    print(f"FINAL RESULTS ({mode})")
+    print("=" * 60)
+    print(json.dumps(all_results, indent=4))
+    return all_results
+
 
 if __name__ == "__main__":
     JSON_PATH = "./MVoQA/AVQA_outputs/modified_train_multi.json"
     VIDEO_DIR = "./MVoQA/AVQA_outputs/video_only"
     AUDIO_DIR = "./MVoQA/AVQA_outputs/audio_only"
-    
+
     dataset = VoQADataset(JSON_PATH, VIDEO_DIR, AUDIO_DIR)
-    
-    models_to_test = {
-        "Custom-VGGish-Visual-Fusion": AudioVideoFusionWrapper(visual_model_name="Qwen/Qwen2.5-VL-3B-Instruct")
-    }
-    
-    run_benchmark(models_to_test, dataset)
+
+    run_benchmark(
+        dataset,
+        registry=MODEL_REGISTRY,
+        device="cuda" if torch.cuda.is_available() else "cpu",
+        mode="pure_zero_shot",
+        save_audio_embeddings_dir="./voqa_audio_logs",
+    )
